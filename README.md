@@ -5,7 +5,7 @@ Features:
 - Curved View
 - Flat View
 - Zoomable in either flat or curved mode.
-- Preview Window available (only shows flat plane of desktop atm).
+- Preview Window available.
 - Terminal Input Supported
 
 Controls:
