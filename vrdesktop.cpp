@@ -795,6 +795,63 @@ static void render_desktop_curved_3d(GLuint desktopTex,
     glDisable(GL_TEXTURE_2D);
 }
 
+static void render_desktop_curved(GLuint desktopTex,
+                                     float planeWidth,
+                                     float planeHeight)
+{
+    if (!desktopTex)
+        return;
+
+    glEnable(GL_TEXTURE_2D);
+    glBindTexture(GL_TEXTURE_2D, desktopTex);
+
+    // How much of a cylinder arc to use (in degrees)
+    const float arcDegrees = 90.0f;     // 90° wrap around you
+    const int   segments   = 64;        // geometry resolution
+
+    // Convert to radians
+    const float arcRadians = arcDegrees * (float)M_PI / 180.0f;
+
+    // planeWidth is the chord length; approximate radius so chord spans arc
+    // chord = 2 * R * sin(theta/2)
+    const float halfArc = arcRadians * 0.5f;
+    const float radius  = planeWidth / (2.0f * sinf(halfArc));
+
+    const float halfHeight = planeHeight * 0.5f;
+
+    // Angle range from -halfArc..+halfArc (screen centered on -Z)
+    const float thetaStart = -halfArc;
+    const float thetaEnd   =  halfArc;
+
+    glBegin(GL_TRIANGLE_STRIP);
+
+    for (int i = 0; i <= segments; ++i) {
+        float t = (float)i / (float)segments;
+        float theta = thetaStart + t * (thetaEnd - thetaStart);
+
+        // Cylinder parametric: around Y axis, facing -Z
+        float x = radius * sinf(theta);
+        float z = -radius * cosf(theta);
+
+        // Texture coordinate across width
+        float u = t;   // 0..1 across arc
+
+        // Top vertex (y = +halfHeight)
+        glTexCoord2f(u, 0.0f);
+        glVertex3f(x, +halfHeight, z);
+
+        // Bottom vertex (y = -halfHeight)
+        glTexCoord2f(u, 1.0f);
+        glVertex3f(x, -halfHeight, z);
+    }
+
+    glEnd();
+
+    glBindTexture(GL_TEXTURE_2D, 0);
+    glDisable(GL_TEXTURE_2D);
+}
+
+
 // Render to SDL window (simple 2D quad)
 static void render_desktop_quad_2d(GLuint desktopTex)
 {
@@ -1083,7 +1140,6 @@ int main(int argc, char **argv)
 
     g_captureRunning.store(true);
     std::thread captureThread(capture_thread_func, &st);
-    captureThread.detach();   // or keep the handle and join at shutdown
 
     // ---------------- Plane size + interaction ----------------
     float planeWidth = 1.5f;
@@ -1231,22 +1287,7 @@ int main(int argc, char **argv)
             running = false;
         }
         }
-     // ------------ 120fps screencopy capture ------------
-/*    static int frameCounter = 0;
-    static const int CAPTURE_EVERY_N_FRAMES = 4;   // 1 = every frame, 2 = every 2nd, etc.
-    // ------------ screencopy capture by frame count ------------
-    if ((frameCounter++ % CAPTURE_EVERY_N_FRAMES) == 0) {
-        if (screencopy_capture(&st) == 0)
-            upload_frame_to_texture(&st, desktopTex, desktopTexInitialized);
-    }*/
-
-//        Uint32 now = SDL_GetTicks();
-//        if (now - lastCaptureMs >= CAPTURE_INTERVAL) {
-//            if (screencopy_capture(&st) == 0)
-//                upload_frame_to_texture(&st, desktopTex, desktopTexInitialized);
-//            lastCaptureMs = now;
-//        }
-
+    // ------------ 120fps screencopy capture ------------
     static uint64_t lastUploadedVersion = 0;
 
     uint64_t v = g_sharedFrame.version.load(std::memory_order_relaxed);
@@ -1260,7 +1301,6 @@ int main(int argc, char **argv)
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_S, GL_CLAMP_TO_EDGE);
             glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_WRAP_T, GL_CLAMP_TO_EDGE);
-    
             glTexImage2D(GL_TEXTURE_2D, 0, GL_RGBA,
                          g_sharedFrame.width,
                          g_sharedFrame.height,
@@ -1393,12 +1433,23 @@ int main(int argc, char **argv)
         if (!hideWindow && desktopTexInitialized) {
             SDL_GetWindowSize(window, &winW, &winH);
             glViewport(0, 0, winW, winH);
-            render_desktop_quad_2d(desktopTex);
+	    glDisable(GL_SCISSOR_TEST);
+	    glClearColor(0.f, 0.f, 0.f, 1.f);
+	    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+                if (g_useCurvedSurface) {
+                    render_desktop_curved(desktopTex, planeWidth, planeHeight);
+                } else {
+                    render_desktop_quad_2d(desktopTex);
+                }
             SDL_GL_SwapWindow(window);
         }
     }
 
     // ---------------- Cleanup ----------------
+    g_captureRunning.store(false);
+    if (captureThread.joinable()) {
+        captureThread.join();
+    }
     if (desktopTex)
         glDeleteTextures(1, &desktopTex);
 
