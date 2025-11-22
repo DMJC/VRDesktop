@@ -16,3 +16,6 @@ Controls:
 
 Roadmap:
 - Tray Icon to select options.
+
+Media:
+<img width="1280" height="750" alt="image" src="https://github.com/user-attachments/assets/c1feda84-6a23-4cf6-a0ba-043e6673d853" />
