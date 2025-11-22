@@ -1,6 +1,7 @@
 VRDesktop
-View your Linux Desktop in Virtual Reality, the application copies a display of your choice to VR as either a flat plane or a curved plane.
+View your Linux Desktop in Virtual Reality, the application copies a display of your choice to VR as either a flat plane or a curved plane. Not tested on KDE or GNOME yet. Working on Wayfire and MATE.
 Features:
+- Supports Wayland and Wayfire Desktops.
 - Curved View
 - Flat View
 - Zoomable in either flat or curved mode.
