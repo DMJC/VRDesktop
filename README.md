@@ -5,7 +5,7 @@ Features:
 - Curved View
 - Flat View
 - Zoomable in either flat or curved mode.
-- Preview Window available (only shows flat plane of desktop atm).
+- Preview Window available.
 - Terminal Input Supported
 - Tray Icon to select options.
 - Config file in ~/.config/vrdesktop/vrdesktop.cfg to save settings.
@@ -18,3 +18,5 @@ Controls:
 
 Caveats:
 - When preview window is enabled Tray Icon doesn't work.
+
+<img width="1280" height="750" alt="image" src="https://github.com/user-attachments/assets/c1feda84-6a23-4cf6-a0ba-043e6673d853" />
