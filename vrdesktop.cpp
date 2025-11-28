@@ -5,14 +5,13 @@
 // - Shows captured desktop on a quad in the SDL window (unless --no-window)
 // - Renders a 3D plane in VR (stereo) floating in front of the user.
 
-#define _GNU_SOURCE
-
 #include <cstdio>
 #include <cstdlib>
 #include <cstdint>
 #include <cstring>
 #include <cerrno>
 
+#include <string>
 #include <termios.h>
 #include <unistd.h>
 #include <fcntl.h>
@@ -32,7 +31,11 @@
 #include <thread>
 #include <mutex>
 #include <vector>
-#include <gtk/gtk.h>
+#include <gtkmm.h>
+#include <gio/gio.h>
+#include <libayatana-appindicator/app-indicator.h>
+#include <libdbusmenu-gtk/dbusmenu-gtk.h>
+
 // --------------------
 
 #include <SDL2/SDL.h>
@@ -46,6 +49,7 @@
 #include <mutex>
 #include <atomic>
 #include <vector>
+#include "config.h"
 
 struct SharedFrame {
     std::mutex m;
@@ -63,8 +67,12 @@ static std::atomic<bool> g_captureRunning{false};
 // Simple shm helper
 // ---------------------------------------------------------------------------
 
+static std::atomic<bool> g_trayToggleRecenter{false};
+static std::atomic<bool> g_trayToggleZoomIn{false};
+static std::atomic<bool> g_trayToggleZoomOut{false};
 static std::atomic<bool> g_trayToggleCurved{false};
 static std::atomic<bool> g_trayTogglePreview{false};
+static std::atomic<bool> g_trayToggleSave{false};
 static std::atomic<bool> g_trayQuitRequest{false};
 
 static int create_shm_file(off_t size)
@@ -449,10 +457,10 @@ static void upload_frame_to_texture(screencopy_state *st,
         glBindTexture(GL_TEXTURE_2D, tex);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
         glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 4);
-	GLfloat maxAniso = 0.0f;
-	glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &maxAniso);
-	glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, maxAniso);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_LEVEL, 4);
+    GLfloat maxAniso = 0.0f;
+    glGetFloatv(GL_MAX_TEXTURE_MAX_ANISOTROPY_EXT, &maxAniso);
+    glTexParameteri(GL_TEXTURE_2D, GL_TEXTURE_MAX_ANISOTROPY_EXT, maxAniso);
 
         glPixelStorei(GL_UNPACK_ALIGNMENT, 4);
         glTexImage2D(
@@ -657,10 +665,13 @@ static void mat4_invert_rigid_row(const float in[16], float out[16])
 }
 
 // --------- Global state for plane and head pose ---------
+static bool running = true;
 static bool g_useCurvedSurface = false;
+static bool hideWindow = true;               // --no-window
 static float g_planePoseRow[16];            // absoluteFromPlane (row-major)
 static bool  g_planePoseInitialized = false;
 static bool  g_curvePoseInitialized = false;
+
 
 static float g_lastAbsoluteFromHeadRow[16]; // absoluteFromHead
 static bool  g_haveHeadPose = false;
@@ -1023,16 +1034,116 @@ static void print_usage(const char *prog)
     );
 }
 
+std::string getConfigPath()
+{
+    const char* home = std::getenv("HOME");
+    if (!home) {
+        // fallback (very rare)
+        home = ".";
+    }
+    std::string path = std::string(home) + "/.config/vrdesktop";
+    // Create the folder if it does not exist
+    mkdir(path.c_str(), 0755);
+    // Append the config file
+    path += "/vrdesktop.cfg";
+    return path;
+}
+
+
+// ---------------------------------------------------------------------------
+// appindicator functions
+// ---------------------------------------------------------------------------
+
+static void on_menu_toggle_recenter(GtkMenuItem*, gpointer) {
+    g_trayToggleRecenter.store(true);
+}
+
+static void on_menu_toggle_zoom_in(GtkMenuItem*, gpointer) {
+    g_trayToggleZoomIn.store(true);
+}
+
+static void on_menu_toggle_zoom_out(GtkMenuItem*, gpointer) {
+    g_trayToggleZoomOut.store(true);
+}
+
+static void on_menu_toggle_curved_flat(GtkMenuItem*, gpointer) {
+    g_trayToggleCurved.store(true);
+}
+
+static void on_menu_toggle_preview(GtkMenuItem*, gpointer) {
+    g_trayTogglePreview.store(true);
+}
+
+static void on_menu_toggle_save(GtkMenuItem*, gpointer) {
+    g_trayToggleSave.store(true);
+}
+
+static void on_menu_quit(GtkMenuItem*, gpointer) {
+    g_trayQuitRequest.store(true);
+}
+
 // ---------------------------------------------------------------------------
 // main
 // ---------------------------------------------------------------------------
 
 int main(int argc, char **argv)
 {
-    const char *requested_output = "DP-3";  // default Wayland output
-    bool hideWindow = false;               // --no-window
-    float planeDistance = 0.5;
-    float curveDistance = -0.6;
+    Config cfg;
+
+    std::string configFile = getConfigPath();
+
+    std::ifstream test(configFile);
+    if (!test.good()) {
+        std::ofstream out(configFile);
+        out << "DP-3\n";
+        out << "curved\n";
+        out << "-0.3\n";
+        out << "enabled\n";
+        out.close();
+    }
+    test.close();
+
+    // Create a new AppIndicator
+    gtk_init(&argc, &argv);
+    AppIndicator *indicator = app_indicator_new(
+        "vrdesktop",
+        "video-display",
+        APP_INDICATOR_CATEGORY_APPLICATION_STATUS
+    );
+    app_indicator_set_status(indicator, APP_INDICATOR_STATUS_ACTIVE);
+    GtkWidget *menu = gtk_menu_new();
+    GtkWidget *item_recenter = gtk_menu_item_new_with_label("Recenter View");
+    GtkWidget *item_zoom_in = gtk_menu_item_new_with_label("Zoom In");
+    GtkWidget *item_zoom_out = gtk_menu_item_new_with_label("Zoom Out");
+    GtkWidget *item_preview = gtk_menu_item_new_with_label("Show Preview");
+    GtkWidget *item_curved = gtk_menu_item_new_with_label("Toggle Curved/Flat");
+    GtkWidget *item_save_config = gtk_menu_item_new_with_label("Save Configuration");
+    GtkWidget *item_quit = gtk_menu_item_new_with_label("Quit");
+
+    g_signal_connect(item_recenter, "activate", G_CALLBACK(on_menu_toggle_recenter), nullptr);
+    g_signal_connect(item_zoom_in, "activate", G_CALLBACK(on_menu_toggle_zoom_in), nullptr);
+    g_signal_connect(item_zoom_out, "activate", G_CALLBACK(on_menu_toggle_zoom_out), nullptr);
+    g_signal_connect(item_curved, "activate", G_CALLBACK(on_menu_toggle_curved_flat), nullptr);
+    g_signal_connect(item_preview, "activate", G_CALLBACK(on_menu_toggle_preview), nullptr);
+    g_signal_connect(item_save_config, "activate", G_CALLBACK(on_menu_toggle_save), nullptr);
+    g_signal_connect(item_quit, "activate", G_CALLBACK(on_menu_quit), nullptr);
+
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item_recenter);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item_zoom_in);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item_zoom_out);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item_preview);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item_curved);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item_save_config);
+    gtk_menu_shell_append(GTK_MENU_SHELL(menu), item_quit);
+    gtk_widget_show_all(menu);
+    app_indicator_set_menu(indicator, GTK_MENU(menu));
+
+    const char *requested_output = cfg.displayOutput.c_str();  // default Wayland output
+    float planeDistance = 0.7;
+    float curveDistance = 0.7;
+    fprintf(stderr, "show window value: %d", cfg.hide_window);
+    fprintf(stderr, "curved window value: %d", cfg.curved);
+
     // ---------------- Parse command line ----------------
     if (argc == 1) {
         print_usage(argv[0]);
@@ -1044,15 +1155,27 @@ int main(int argc, char **argv)
         } else if (strcmp(argv[i], "-n") == 0 || strcmp(argv[i], "--no-window") == 0) {
             hideWindow = true;
         } else if ((strcmp(argv[i], "-d") == 0 ) && i + 1 < argc){
-	    planeDistance = strtof(argv[++i],nullptr);
-	    curveDistance = strtof(argv[++i],nullptr);
-	} else if (strcmp(argv[i], "-c") == 0) {
+        planeDistance = strtof(argv[++i],nullptr);
+        curveDistance = strtof(argv[++i],nullptr);
+    } else if (strcmp(argv[i], "-c") == 0) {
             g_useCurvedSurface = true;
             fprintf(stderr, "Using curved desktop surface.\n");
-	} else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
+    } else if (strcmp(argv[i], "-h") == 0 || strcmp(argv[i], "--help") == 0) {
             print_usage(argv[0]);
             return 0;
         }
+    }
+
+    if (!loadConfig(configFile, cfg)) {
+        fprintf(stderr, "unable to load config");
+        return 1;
+    } else {
+    fprintf(stderr, "config file loaded");
+        requested_output = cfg.displayOutput.c_str();
+        planeDistance = cfg.distance;
+        curveDistance = cfg.distance;
+        g_useCurvedSurface = cfg.curved;
+        hideWindow = cfg.hide_window;
     }
 
     fprintf(stderr, "Requested output: %s\n", requested_output);
@@ -1154,68 +1277,67 @@ int main(int argc, char **argv)
     const float curveDistanceMax = 5.0f;
 
     // ---------------- Main loop ----------------
-    bool running = true;
-/*    Uint32 lastCaptureMs = SDL_GetTicks();
-    const Uint32 CAPTURE_INTERVAL = 1000 / 1200;*/
     while (running) {
-	    if (!hideWindow) {
-        	// ------------ Input handling ------------
-        	SDL_Event e;
-        	while (SDL_PollEvent(&e)) {
-        	    if (e.type == SDL_QUIT) running = false;
-	            if (e.type == SDL_KEYDOWN) {
-	                SDL_Keycode key = e.key.keysym.sym;
-	                if (key == SDLK_ESCAPE)
-	                    running = false;
-        	        else if (key == SDLK_KP_PLUS) {
-        	            // Zoom in
-				if (!g_useCurvedSurface){
-		                    planeDistance -= 0.1f;
-		                    if (planeDistance < planeDistanceMin){
-	        	                planeDistance = planeDistanceMin;
-	                	    recenter_plane(planeDistance);
-			    	    }
-				}else{
-				    printf("using curved\n");
-		                    curveDistance -= 0.1f;
-		                    if (curveDistance < curveDistanceMin){
-        		                curveDistance = curveDistanceMin;
-				    recenter_curve(curveDistance);
-				    }
-				}
-                	}
-	                else if (key == SDLK_KP_MINUS) {
-	                    // Zoom out
-				if (!g_useCurvedSurface){
-		                    planeDistance += 0.1f;
-		                    if (planeDistance > planeDistanceMax){
-	        	                planeDistance = planeDistanceMax;
-	                	    recenter_plane(planeDistance);
-			    	    }
-				}else{
-		                    curveDistance += 0.1f;
-		                    if (curveDistance > curveDistanceMax){
-        		                curveDistance = curveDistanceMax;
-				    recenter_curve(curveDistance);
-				    }
-				}
-                	}
+        while (gtk_events_pending()){
+            gtk_main_iteration_do(FALSE);
+        }
+        if (!hideWindow) {
+            // ------------ Input handling ------------
+            SDL_Event e;
+            while (SDL_PollEvent(&e)) {
+                if (e.type == SDL_QUIT) running = false;
+               if (e.type == SDL_KEYDOWN) {
+                    SDL_Keycode key = e.key.keysym.sym;
+                    if (key == SDLK_ESCAPE || SDLK_q)
+                        running = false;
+                    else if (key == SDLK_KP_PLUS) {
+                        // Zoom in
+                   if (!g_useCurvedSurface){
+                        planeDistance -= 0.1f;
+                        if (planeDistance < planeDistanceMin){
+                            planeDistance = planeDistanceMin;
+                                recenter_plane(planeDistance);
+                    }
+                }else{
+                        curveDistance -= 0.1f;
+                        if (curveDistance < curveDistanceMin){
+                            curveDistance = curveDistanceMin;
+                        recenter_curve(curveDistance);
+                }
+                }
+                    }
+                    else if (key == SDLK_KP_MINUS) {
+                        // Zoom out
+                if (!g_useCurvedSurface){
+                        planeDistance += 0.1f;
+                        if (planeDistance > planeDistanceMax){
+                            planeDistance = planeDistanceMax;
+                            recenter_plane(planeDistance);
+                    }
+                }else{
+                        curveDistance += 0.1f;
+                        if (curveDistance > curveDistanceMax){
+                            curveDistance = curveDistanceMax;
+                        recenter_curve(curveDistance);
+                }
+                }
+                    }
 
-	                else if (key == SDLK_KP_5) {
-	                    // Recenter plane at current distance
-				if (!g_useCurvedSurface){
-		                    recenter_plane(planeDistance);
-				}else{
-		                    recenter_curve(curveDistance);
-				}
-			} else if (key == SDLK_c) {
-		            g_useCurvedSurface = !g_useCurvedSurface;
-		            fprintf(stderr, "Surface mode: %s\n",
-	                    g_useCurvedSurface ? "curved" : "flat");
-        		}
-	        }
-	}
-	} else {
+                    else if (key == SDLK_KP_5) {
+                        // Recenter plane at current distance
+                if (!g_useCurvedSurface){
+                            recenter_plane(planeDistance);
+                }else{
+                            recenter_curve(curveDistance);
+                }
+            } else if (key == SDLK_c) {
+                    g_useCurvedSurface = !g_useCurvedSurface;
+                    fprintf(stderr, "Surface mode: %s\n",
+                        g_useCurvedSurface ? "curved" : "flat");
+                }
+            }
+    }
+    } else {
         // CLI mode: read keys from terminal
         if (hideWindow && g_raw_enabled) {
             char ch;
@@ -1225,68 +1347,108 @@ int main(int argc, char **argv)
                 if (ch == 'q' || ch == 'Q') {
                     running = false;
                 } else if (ch == '+') {
-			if (!g_useCurvedSurface){
-        	            planeDistance -= 0.1f;
-        	            if (planeDistance < planeDistanceMin)
-        	                planeDistance = planeDistanceMin;
-        	            recenter_plane(planeDistance);
-        	            fprintf(stderr, "Zoom in (CLI): distance=%.2f\n", planeDistance);
-			} else {
-        	            curveDistance -= 0.1f;
-        	            if (curveDistance < curveDistanceMin)
-        	                curveDistance = curveDistanceMin;
-        	            recenter_curve(curveDistance);
-        	            fprintf(stderr, "Zoom in (CLI): distance=%.2f\n", planeDistance);
-			}
-        	} else if (ch == '-') {
-			if (!g_useCurvedSurface){
-        	            planeDistance += 0.1f;
-        	            if (planeDistance > planeDistanceMax)
-        	                planeDistance = planeDistanceMax;
-        	            recenter_plane(planeDistance);
-        	            fprintf(stderr, "Zoom out (CLI): distance=%.2f\n", planeDistance);
-			} else {
-        	            curveDistance += 0.1f;
-        	            if (curveDistance < curveDistanceMin)
-        	                curveDistance = curveDistanceMin;
-        	            recenter_curve(curveDistance);
-        	            fprintf(stderr, "Zoom in (CLI): distance=%.2f\n", planeDistance);
-			}
+            if (!g_useCurvedSurface){
+                        planeDistance -= 0.1f;
+                        if (planeDistance < planeDistanceMin)
+                            planeDistance = planeDistanceMin;
+                        recenter_plane(planeDistance);
+                        fprintf(stderr, "Zoom in (CLI): distance=%.2f\n", planeDistance);
+            } else {
+                        curveDistance -= 0.1f;
+                        if (curveDistance < curveDistanceMin)
+                            curveDistance = curveDistanceMin;
+                        recenter_curve(curveDistance);
+                        fprintf(stderr, "Zoom in (CLI): distance=%.2f\n", planeDistance);
+            }
+            } else if (ch == '-') {
+            if (!g_useCurvedSurface){
+                        planeDistance += 0.1f;
+                        if (planeDistance > planeDistanceMax)
+                            planeDistance = planeDistanceMax;
+                        recenter_plane(planeDistance);
+                        fprintf(stderr, "Zoom out (CLI): distance=%.2f\n", planeDistance);
+            } else {
+                        curveDistance += 0.1f;
+                        if (curveDistance < curveDistanceMin)
+                            curveDistance = curveDistanceMin;
+                        recenter_curve(curveDistance);
+                        fprintf(stderr, "Zoom out (CLI): distance=%.2f\n", planeDistance);
+            }
                 } else if (ch == '5') {
                     recenter_plane(planeDistance);
                     fprintf(stderr, "Recenter (CLI)\n");
                 } else if (ch == 27) { // ESC
                     running = false;
-		} else if (ch == 'c') {
-	            g_useCurvedSurface = !g_useCurvedSurface;
-	            fprintf(stderr, "Surface mode: %s\n",
+        } else if (ch == 'c') {
+                g_useCurvedSurface = !g_useCurvedSurface;
+                fprintf(stderr, "Surface mode: %s\n",
                     g_useCurvedSurface ? "curved" : "flat");
-       		}
+               }
             }
-	}
+    }
         // ------------ Tray actions ------------
+        if (g_trayToggleRecenter.exchange(false)) {
+            recenter_plane(planeDistance);
+            fprintf(stderr, "Recentering View\n");
+        }
+        if (g_trayToggleZoomIn.exchange(false)) {
+                        if (!g_useCurvedSurface){
+                            planeDistance -= 0.1f;
+                            if (planeDistance < planeDistanceMin)
+                                planeDistance = planeDistanceMin;
+                            recenter_plane(planeDistance);
+                            fprintf(stderr, "Zoom in (CLI): distance=%.2f\n", planeDistance);
+                        } else {
+                            curveDistance -= 0.1f;
+                            if (curveDistance < curveDistanceMin)
+                                curveDistance = curveDistanceMin;
+                            recenter_curve(curveDistance);
+                            fprintf(stderr, "Zoom in (CLI): distance=%.2f\n", planeDistance);
+                        }
+
+        }
+        if (g_trayToggleZoomOut.exchange(false)) {
+            if (!g_useCurvedSurface){
+                        planeDistance += 0.1f;
+                        if (planeDistance > planeDistanceMax)
+                            planeDistance = planeDistanceMax;
+                        recenter_plane(planeDistance);
+                        fprintf(stderr, "Zoom out (CLI): distance=%.2f\n", planeDistance);
+            } else {
+                        curveDistance += 0.1f;
+                        if (curveDistance < curveDistanceMin)
+                            curveDistance = curveDistanceMin;
+                        recenter_curve(curveDistance);
+                        fprintf(stderr, "Zoom out (CLI): distance=%.2f\n", planeDistance);
+            }
+        }
         if (g_trayToggleCurved.exchange(false)) {
             g_useCurvedSurface = !g_useCurvedSurface;
-            fprintf(stderr, "Surface mode (tray): %s\n",
-                    g_useCurvedSurface ? "curved" : "flat");
+            fprintf(stderr, "Surface mode (tray): %s\n", g_useCurvedSurface ? "curved" : "flat");
         }
-
         if (g_trayTogglePreview.exchange(false)) {
             hideWindow = !hideWindow;
+        fprintf(stderr, "Window Hidden: %d\n", hideWindow);
             if (hideWindow) {
                 SDL_HideWindow(window);
-                fprintf(stderr, "Preview window hidden (tray)\n");
             } else {
                 SDL_ShowWindow(window);
-                fprintf(stderr, "Preview window shown (tray)\n");
             }
+            fprintf(stderr, "Surface mode (tray): %s\n", hideWindow ? "Hidden" : "Shown");
         }
-
+        if (g_trayToggleSave.exchange(false)) {
+            if (!saveConfig(configFile, cfg)) {
+                fprintf(stderr, "Unable to save config\n");
+                return 1;
+            } else {
+                fprintf(stderr, "Configuration Saved\n");
+	    }
+        }
         if (g_trayQuitRequest.exchange(false)) {
             fprintf(stderr, "Quit requested from tray\n");
             running = false;
         }
-        }
+    }
     // ------------ 120fps screencopy capture ------------
     static uint64_t lastUploadedVersion = 0;
 
@@ -1322,89 +1484,89 @@ int main(int argc, char **argv)
 
 
         // ------------ VR rendering ------------
-	if (vr_ok && desktopTexInitialized) {
-	    vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
-	    vr::VRCompositor()->WaitGetPoses(
-	        poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
+    if (vr_ok && desktopTexInitialized) {
+        vr::TrackedDevicePose_t poses[vr::k_unMaxTrackedDeviceCount];
+        vr::VRCompositor()->WaitGetPoses(
+        poses, vr::k_unMaxTrackedDeviceCount, nullptr, 0);
 
-    // ---- Get latest HMD pose once per frame ----
-    const vr::TrackedDevicePose_t &hmdPose =
+        // ---- Get latest HMD pose once per frame ----
+        const vr::TrackedDevicePose_t &hmdPose =
         poses[vr::k_unTrackedDeviceIndex_Hmd];
 
-    if (hmdPose.bPoseIsValid) {
-        mat4_from_HmdMatrix34_row(
-        hmdPose.mDeviceToAbsoluteTracking,
-        g_lastAbsoluteFromHeadRow
-        );
-        g_haveHeadPose = true;
+        if (hmdPose.bPoseIsValid) {
+            mat4_from_HmdMatrix34_row(
+            hmdPose.mDeviceToAbsoluteTracking,
+            g_lastAbsoluteFromHeadRow
+            );
+            g_haveHeadPose = true;
 
-        // First-time setup of plane/curve pose
-        if (!g_planePoseInitialized) {
-            recenter_plane(planeDistance);
+            // First-time setup of plane/curve pose
+            if (!g_planePoseInitialized) {
+                recenter_plane(planeDistance);
+            }
+            if (!g_curvePoseInitialized) {
+                recenter_curve(curveDistance);
+            }
         }
-        if (!g_curvePoseInitialized) {
-            recenter_curve(curveDistance);
-        }
-    }
-	    // Safety: if we *still* don't have a pose, skip VR for this frame
-	    if (!g_haveHeadPose) {
-	        // Optionally clear the eye FBOs to black so they don't contain garbage
-        	for (int eye = 0; eye < 2; ++eye) {
-	            glBindFramebuffer(GL_FRAMEBUFFER, vrState.eyeFbo[eye]);
-	            glViewport(0, 0, vrState.rtWidth, vrState.rtHeight);
-	            glClearColor(0.f, 0.f, 0.f, 1.f);
-	            glClear(GL_COLOR_BUFFER_BIT);
-	        }
-        	glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	    } else {
-	        // ---- Render each eye using the same HMD pose ----
-        	for (int eye = 0; eye < 2; ++eye) {
-	       	    vr::Hmd_Eye vrEye = (eye == 0) ? vr::Eye_Left : vr::Eye_Right;
+        // Safety: if we *still* don't have a pose, skip VR for this frame
+        if (!g_haveHeadPose) {
+            // Optionally clear the eye FBOs to black so they don't contain garbage
+            for (int eye = 0; eye < 2; ++eye) {
+                glBindFramebuffer(GL_FRAMEBUFFER, vrState.eyeFbo[eye]);
+                glViewport(0, 0, vrState.rtWidth, vrState.rtHeight);
+                glClearColor(0.f, 0.f, 0.f, 1.f);
+                glClear(GL_COLOR_BUFFER_BIT);
+            }
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        } else {
+            // ---- Render each eye using the same HMD pose ----
+            for (int eye = 0; eye < 2; ++eye) {
+                vr::Hmd_Eye vrEye = (eye == 0) ? vr::Eye_Left : vr::Eye_Right;
 
-	            // Get eye->head transform from OpenVR
-        	    vr::HmdMatrix34_t eyeToHead =
-	                vrState.system->GetEyeToHeadTransform(vrEye);
+                // Get eye->head transform from OpenVR
+                vr::HmdMatrix34_t eyeToHead =
+                    vrState.system->GetEyeToHeadTransform(vrEye);
 
-	            float headFromEye[16];
-	            mat4_from_HmdMatrix34_row(eyeToHead, headFromEye);
+                float headFromEye[16];
+                mat4_from_HmdMatrix34_row(eyeToHead, headFromEye);
 
-	            // absolute<-eye = absolute<-head * head<-eye
-	            float absoluteFromEye[16];
-	            mat4_mul_row(g_lastAbsoluteFromHeadRow, headFromEye, absoluteFromEye);
+                // absolute<-eye = absolute<-head * head<-eye
+                float absoluteFromEye[16];
+                mat4_mul_row(g_lastAbsoluteFromHeadRow, headFromEye, absoluteFromEye);
 
-	            // eye<-absolute = inverse(absolute<-eye)
-	            float eyeFromAbsoluteRow[16];
-	            mat4_invert_rigid_row(absoluteFromEye, eyeFromAbsoluteRow);
+                // eye<-absolute = inverse(absolute<-eye)
+                float eyeFromAbsoluteRow[16];
+                mat4_invert_rigid_row(absoluteFromEye, eyeFromAbsoluteRow);
 
-	            // eye<-plane = eye<-absolute * absolute<-plane
-	            float eyeFromPlaneRow[16];
-        	    mat4_mul_row(eyeFromAbsoluteRow, g_planePoseRow, eyeFromPlaneRow);
+                // eye<-plane = eye<-absolute * absolute<-plane
+                float eyeFromPlaneRow[16];
+                mat4_mul_row(eyeFromAbsoluteRow, g_planePoseRow, eyeFromPlaneRow);
 
-	            // Convert to column-major for OpenGL
-        	    float mvCol[16];
-	            mat4_row_to_col(eyeFromPlaneRow, mvCol);
+                // Convert to column-major for OpenGL
+                float mvCol[16];
+                mat4_row_to_col(eyeFromPlaneRow, mvCol);
 
-        	    // Projection from OpenVR
-	            vr::HmdMatrix44_t proj =
-                	vrState.system->GetProjectionMatrix(vrEye, 0.1f, 100.0f);
+                // Projection from OpenVR
+                vr::HmdMatrix44_t proj =
+                    vrState.system->GetProjectionMatrix(vrEye, 0.1f, 100.0f);
 
-        	    float projCol[16];
-	            for (int r = 0; r < 4; ++r)
-                	for (int c = 0; c < 4; ++c)
-        	            projCol[c*4 + r] = proj.m[r][c];
+                float projCol[16];
+                for (int r = 0; r < 4; ++r)
+                    for (int c = 0; c < 4; ++c)
+                        projCol[c*4 + r] = proj.m[r][c];
 
-	            // --- Draw into this eye's FBO ---
-	            glBindFramebuffer(GL_FRAMEBUFFER, vrState.eyeFbo[eye]);
-	            glViewport(0, 0, vrState.rtWidth, vrState.rtHeight);
+                // --- Draw into this eye's FBO ---
+                glBindFramebuffer(GL_FRAMEBUFFER, vrState.eyeFbo[eye]);
+                glViewport(0, 0, vrState.rtWidth, vrState.rtHeight);
 
-	            glMatrixMode(GL_PROJECTION);
-        	    glLoadMatrixf(projCol);
+                glMatrixMode(GL_PROJECTION);
+                glLoadMatrixf(projCol);
 
-	            glMatrixMode(GL_MODELVIEW);
-	            glLoadMatrixf(mvCol);
+                glMatrixMode(GL_MODELVIEW);
+                glLoadMatrixf(mvCol);
 
-	            glClearColor(0.f, 0.f, 0.f, 1.f);
-	            glClear(GL_COLOR_BUFFER_BIT);
+                glClearColor(0.f, 0.f, 0.f, 1.f);
+                glClear(GL_COLOR_BUFFER_BIT);
 
                 if (g_useCurvedSurface) {
                     render_desktop_curved_3d(desktopTex, planeWidth, planeHeight);
@@ -1412,35 +1574,35 @@ int main(int argc, char **argv)
                     render_desktop_plane_3d(desktopTex, planeWidth, planeHeight);
                 }
             }
-	        glBindFramebuffer(GL_FRAMEBUFFER, 0);
-	    }
+            glBindFramebuffer(GL_FRAMEBUFFER, 0);
+        }
 
-	    // ---- Submit both eyes to the compositor ----
-	    vr::Texture_t leftEyeTex  = {
-	        (void*)(uintptr_t)vrState.eyeTex[0],
-	        vr::TextureType_OpenGL,
-	        vr::ColorSpace_Auto
-	    };
-	    vr::Texture_t rightEyeTex = {
-	        (void*)(uintptr_t)vrState.eyeTex[1],
-	        vr::TextureType_OpenGL,
-	        vr::ColorSpace_Auto
-	    };
-	    vr::VRCompositor()->Submit(vr::Eye_Left,  &leftEyeTex);
-	    vr::VRCompositor()->Submit(vr::Eye_Right, &rightEyeTex);
-	}
+        // ---- Submit both eyes to the compositor ----
+        vr::Texture_t leftEyeTex  = {
+            (void*)(uintptr_t)vrState.eyeTex[0],
+            vr::TextureType_OpenGL,
+            vr::ColorSpace_Auto
+        };
+        vr::Texture_t rightEyeTex = {
+            (void*)(uintptr_t)vrState.eyeTex[1],
+            vr::TextureType_OpenGL,
+            vr::ColorSpace_Auto
+        };
+        vr::VRCompositor()->Submit(vr::Eye_Left,  &leftEyeTex);
+        vr::VRCompositor()->Submit(vr::Eye_Right, &rightEyeTex);
+    }
         // ------------ Optional SDL window preview ------------
         if (!hideWindow && desktopTexInitialized) {
             SDL_GetWindowSize(window, &winW, &winH);
             glViewport(0, 0, winW, winH);
-	    glDisable(GL_SCISSOR_TEST);
-	    glClearColor(0.f, 0.f, 0.f, 1.f);
-	    glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
-                if (g_useCurvedSurface) {
-                    render_desktop_curved(desktopTex, planeWidth, planeHeight);
-                } else {
-                    render_desktop_quad_2d(desktopTex);
-                }
+            glDisable(GL_SCISSOR_TEST);
+            glClearColor(0.f, 0.f, 0.f, 1.f);
+            glClear(GL_COLOR_BUFFER_BIT | GL_DEPTH_BUFFER_BIT);
+            if (g_useCurvedSurface) {
+                render_desktop_curved(desktopTex, planeWidth, planeHeight);
+            } else {
+                render_desktop_quad_2d(desktopTex);
+            }
             SDL_GL_SwapWindow(window);
         }
     }
@@ -1452,8 +1614,7 @@ int main(int argc, char **argv)
     }
     if (desktopTex)
         glDeleteTextures(1, &desktopTex);
-
-    shutdown_openvr(vrState);
+        shutdown_openvr(vrState);
 
     if (st.buffer) wl_buffer_destroy(st.buffer);
     if (st.pool) wl_shm_pool_destroy(st.pool);

@@ -7,6 +7,8 @@ Features:
 - Zoomable in either flat or curved mode.
 - Preview Window available (only shows flat plane of desktop atm).
 - Terminal Input Supported
+- Tray Icon to select options.
+- Config file in ~/.config/vrdesktop/vrdesktop.cfg to save settings.
 
 Controls:
 - -c enables curved mode.
@@ -14,5 +16,5 @@ Controls:
 - -o select an output e.g -o DP-3 to use Display Port 3 as input source for desktop image.
 - -d set zoom level.
 
-Roadmap:
-- Tray Icon to select options.
+Caveats:
+- When preview window is enabled Tray Icon doesn't work.
